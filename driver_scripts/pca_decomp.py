@@ -18,7 +18,7 @@ def _add_repo_root_to_syspath() -> Path:
 
 REPO_ROOT = _add_repo_root_to_syspath()
 
-from scripts.pca_decomposition import run_pca_auto, pair_plot
+from src.pca_decomposition import run_pca_auto, pair_plot
 
 
 def parse_args() -> argparse.Namespace:

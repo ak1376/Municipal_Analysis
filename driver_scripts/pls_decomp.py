@@ -17,7 +17,7 @@ def _add_repo_root_to_syspath() -> Path:
 
 REPO_ROOT = _add_repo_root_to_syspath()
 
-from scripts.pls_decomposition import run_pls_auto, pair_plot
+from src.pls_decomposition import run_pls_auto, pair_plot
 
 
 def _read_features(path: Path) -> pd.DataFrame:

@@ -1,0 +1,23 @@
+# config/splits_nj.yaml
+dataset:
+  mode: processed_csv
+  processed:
+    x_csv: data/features.csv
+    y_csv: data/qualification_target.csv
+    target_col: Qualified Municipality
+
+output:
+  # relative to repo root
+  root_dir: data/splits
+
+  # Option A (recommended): pick a human prefix, script appends __<fingerprint>
+  name_prefix: nj_baseline
+
+  # Option B: fixed name (no suffix). Only use if you WANT overwrites:
+  # name: nj_baseline_fixed
+
+split:
+  strategy: train_test   # or: cv_only
+  test_size: 0.25
+  random_state: 0
+  stratify: true
