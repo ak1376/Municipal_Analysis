@@ -24,16 +24,31 @@ from sklearn.metrics import (
 )
 
 """
-Holdout-only statsmodels logistic regression driver.
+Holdout-only statsmodels logistic regression driver (NO CV),
+with "predictions for ALL datapoints" that preserve the ORIGINAL row order
+from your input files (mirrors your SVM script).
 
-Always:
-  1) stratified train/test split
-  2) fit on train
-  3) evaluate once on test
+Key outputs:
+  analysis/<space-name>/logistic_regression/holdout/
+    - metrics_test.txt
+    - confusion_matrix_test.png
+    - roc_curve_test.png
+    - run_config.json
+    - statsmodels_logit_summary.txt
+    - coefficients.csv
+    - predictions_all_in_original_order.csv
+    - note_predictions_all.txt
+  (optional --refit-full)
+    - predictions_all_refit_full.csv
+    - note_predictions_all_refit_full.txt
 
-(Optional) threshold optimization:
-  - if --optimize-threshold is set, choose threshold using TRAIN in-sample probabilities
-    (documented; no test leakage, but not as clean as inner-CV).
+Row order / shuffling:
+- We NEVER shuffle the dataset itself.
+- We create train/test SPLITS by sampling indices, but we store predictions back into
+  an array aligned to the original row order (0..N-1 after optional NA dropping).
+- predictions_all_in_original_order.csv is sorted by row_index ascending, so row_index i
+  corresponds to row i of the *post-dropna aligned* X/y.
+- orig_row_index maps back to the original loaded file row number before dropping NA.
 """
 
 # ----------------------------
@@ -94,24 +109,6 @@ def read_target(path: Path, target_col: str) -> pd.Series:
     return coerce_binary_target(df[target_col], name=target_col)
 
 
-def align_xy(X: pd.DataFrame, y: pd.Series, *, drop_na: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
-    if len(X) != len(y):
-        raise ValueError(
-            f"Row mismatch: X has {len(X)} rows, y has {len(y)} rows. "
-            "Make sure both were generated from the same filtered rows and saved in the same order."
-        )
-
-    X2 = X.copy()
-    y2 = y.copy()
-
-    if drop_na:
-        keep = ~(X2.isna().any(axis=1) | y2.isna())
-        X2 = X2.loc[keep].reset_index(drop=True)
-        y2 = y2.loc[keep].reset_index(drop=True)
-
-    return X2, y2
-
-
 def split_raw_csv(
     raw_csv: Path,
     *,
@@ -155,22 +152,36 @@ def coerce_X_to_numeric(X: pd.DataFrame) -> pd.DataFrame:
     return Xn
 
 
+def align_xy_preserve_original_index(
+    X: pd.DataFrame, y: pd.Series, *, drop_na: bool = True
+) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
+    """
+    Align X and y by row order, optionally drop NA rows, and return:
+      - X_aligned
+      - y_aligned
+      - orig_row_index: mapping back to the original row indices BEFORE drop_na
+    """
+    if len(X) != len(y):
+        raise ValueError(
+            f"Row mismatch: X has {len(X)} rows, y has {len(y)} rows. "
+            "Make sure both were saved in the same order."
+        )
+
+    orig_idx = np.arange(len(y), dtype=int)
+
+    if drop_na:
+        keep = ~(X.isna().any(axis=1) | y.isna())
+        X2 = X.loc[keep].reset_index(drop=True)
+        y2 = y.loc[keep].reset_index(drop=True)
+        orig_idx2 = orig_idx[keep.values]
+        return X2, y2, orig_idx2
+
+    return X.reset_index(drop=True), y.reset_index(drop=True), orig_idx
+
+
 # ----------------------------
-# Modeling + outputs
+# Plots
 # ----------------------------
-def fit_logit_statsmodels(X: pd.DataFrame, y: pd.Series, *, add_intercept: bool = True):
-    X_mat = coerce_X_to_numeric(X)
-    if add_intercept:
-        X_mat = sm.add_constant(X_mat, has_constant="add")
-    model = sm.Logit(y, X_mat)
-    res = model.fit(disp=False)
-    return res, X_mat
-
-
-def save_statsmodels_summary(result, out_path: Path) -> None:
-    out_path.write_text(result.summary2().as_text())
-
-
 def plot_and_save_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -218,6 +229,9 @@ def plot_and_save_roc(
     return float(roc_auc)
 
 
+# ----------------------------
+# Thresholding helpers
+# ----------------------------
 def _probs_to_preds(probs: np.ndarray, threshold: float) -> np.ndarray:
     return (probs >= threshold).astype(int)
 
@@ -237,21 +251,45 @@ def find_best_threshold(
     if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
         thr = 0.5
         preds = _probs_to_preds(probs, thr)
-        val = balanced_accuracy_score(y_true, preds) if metric == "balanced_accuracy" else accuracy_score(y_true, preds)
+        val = (
+            balanced_accuracy_score(y_true, preds)
+            if metric == "balanced_accuracy"
+            else accuracy_score(y_true, preds)
+        )
         return float(thr), float(val)
 
     thresholds = np.linspace(lo, hi, num=int(grid_size))
     best_thr = float(thresholds[0])
     best_val = -np.inf
-
     for thr in thresholds:
         preds = _probs_to_preds(probs, float(thr))
-        v = balanced_accuracy_score(y_true, preds) if metric == "balanced_accuracy" else accuracy_score(y_true, preds)
+        v = (
+            balanced_accuracy_score(y_true, preds)
+            if metric == "balanced_accuracy"
+            else accuracy_score(y_true, preds)
+        )
         if v > best_val:
-            best_val = v
+            best_val = float(v)
             best_thr = float(thr)
-
     return float(best_thr), float(best_val)
+
+
+# ----------------------------
+# Model helpers
+# ----------------------------
+def fit_logit_statsmodels(
+    X: pd.DataFrame, y: pd.Series, *, add_intercept: bool = True
+):
+    X_mat = coerce_X_to_numeric(X)
+    if add_intercept:
+        X_mat = sm.add_constant(X_mat, has_constant="add")
+    model = sm.Logit(y, X_mat)
+    res = model.fit(disp=False)
+    return res, X_mat
+
+
+def save_statsmodels_summary(result, out_path: Path) -> None:
+    out_path.write_text(result.summary2().as_text())
 
 
 def _save_coefficients_csv(
@@ -274,18 +312,25 @@ def _save_coefficients_csv(
     coef_df.to_csv(out_path, index=False)
 
 
+def _write_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(obj, indent=2) + "\n")
+
+
 # ----------------------------
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Holdout-only statsmodels logistic regression (no cross-validation)."
+        description=(
+            "Holdout-only statsmodels logistic regression (no CV). Fits on train split, "
+            "evaluates on test split, and saves predictions for ALL datapoints in ORIGINAL row order."
+        )
     )
 
     p.add_argument("--mode", choices=["space", "raw"], default="space")
 
     # space-mode inputs
-    p.add_argument("--x", type=Path, default=Path("analysis/pca/pca_space.npy"))
+    p.add_argument("--x", type=Path, default=Path("data/features.csv"))
     p.add_argument("--y", type=Path, default=Path("data/qualification_target.csv"))
 
     # raw-mode input
@@ -295,12 +340,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--target-col", type=str, default="Qualified Municipality")
 
-    # Holdout split
+    # Split params
     p.add_argument("--test-size", type=float, default=0.25)
     p.add_argument("--random-state", type=int, default=0)
 
-    # Output
-    p.add_argument("--space-name", type=str, default="pca")
+    # Output organization
+    p.add_argument("--space-name", type=str, default="raw_features")
     p.add_argument("--out-root", type=Path, default=Path("analysis"))
 
     # Modeling knobs
@@ -309,12 +354,26 @@ def parse_args() -> argparse.Namespace:
 
     # Threshold optimization
     p.add_argument("--optimize-threshold", action="store_true")
-    p.add_argument("--threshold-metric", choices=["balanced_accuracy", "accuracy"], default="balanced_accuracy")
+    p.add_argument(
+        "--threshold-metric",
+        choices=["balanced_accuracy", "accuracy"],
+        default="balanced_accuracy",
+    )
     p.add_argument("--threshold-grid-size", type=int, default=200)
+
+    # Optional refit on full dataset after evaluation (for a production model)
+    p.add_argument(
+        "--refit-full",
+        action="store_true",
+        help="After evaluating on test, refit the same model on ALL data and save predictions_all_refit_full.csv",
+    )
 
     return p.parse_args()
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> None:
     args = parse_args()
     add_intercept = not args.no_intercept
@@ -324,19 +383,19 @@ def main() -> None:
 
     # Load X,y
     if args.mode == "space":
-        X = read_design_matrix(args.x)
-        y = read_target(args.y, args.target_col)
-        X, y = align_xy(X, y, drop_na=True)
+        X_raw = read_design_matrix(args.x)
+        y_raw = read_target(args.y, args.target_col)
+        X, y, orig_row_index = align_xy_preserve_original_index(X_raw, y_raw, drop_na=True)
     else:
         if args.raw_csv is None:
             raise ValueError("--raw-csv is required when --mode raw")
-        X, y = split_raw_csv(
+        X_raw, y_raw = split_raw_csv(
             args.raw_csv,
             target_col=args.target_col,
             drop_cols=args.drop_cols,
             feature_cols=args.feature_cols,
         )
-        X, y = align_xy(X, y, drop_na=True)
+        X, y, orig_row_index = align_xy_preserve_original_index(X_raw, y_raw, drop_na=True)
 
     X = coerce_X_to_numeric(X)
 
@@ -344,12 +403,22 @@ def main() -> None:
     if len(uniq) != 2:
         raise ValueError(f"Target must have two classes; got {uniq.tolist()}.")
 
-    # Holdout split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.random_state, stratify=y
+    n = len(y)
+
+    # IMPORTANT: we split on INDICES, not by shuffling rows
+    idx = np.arange(n, dtype=int)
+    train_idx, test_idx = train_test_split(
+        idx,
+        test_size=float(args.test_size),
+        random_state=int(args.random_state),
+        shuffle=True,
+        stratify=y.values,
     )
 
-    # Fit
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+    # Fit on train
     res, X_tr_mat = fit_logit_statsmodels(X_train, y_train, add_intercept=add_intercept)
 
     # Threshold (optionally optimize on TRAIN in-sample probs)
@@ -357,7 +426,10 @@ def main() -> None:
     train_probs = np.asarray(res.predict(X_tr_mat)).ravel()
     if args.optimize_threshold:
         thr_used, thr_val = find_best_threshold(
-            y_train.values, train_probs, metric=args.threshold_metric, grid_size=args.threshold_grid_size
+            y_true=y_train.values,
+            probs=train_probs,
+            metric=args.threshold_metric,
+            grid_size=int(args.threshold_grid_size),
         )
         (out_dir / "threshold_optimized_train_only.txt").write_text(
             "\n".join(
@@ -365,7 +437,7 @@ def main() -> None:
                     f"optimized_threshold: {thr_used}",
                     f"optimized_metric: {args.threshold_metric}",
                     f"optimized_metric_value_train_in_sample: {thr_val}",
-                    "note: optimized on training in-sample probabilities (no test leakage; may be optimistic).",
+                    "note: optimized on TRAIN in-sample probabilities (no CV).",
                 ]
             )
             + "\n"
@@ -379,10 +451,11 @@ def main() -> None:
     test_probs = np.asarray(res.predict(X_te_mat)).ravel()
     test_pred = _probs_to_preds(test_probs, thr_used)
 
-    acc = float(accuracy_score(y_test.values, test_pred))
-    bal = float(balanced_accuracy_score(y_test.values, test_pred))
-    auc_val = float(roc_auc_score(y_test.values, test_probs))
+    test_acc = float(accuracy_score(y_test.values, test_pred))
+    test_bal = float(balanced_accuracy_score(y_test.values, test_pred))
+    test_auc = float(roc_auc_score(y_test.values, test_probs))
 
+    # Save summary + coefficients
     save_statsmodels_summary(res, out_dir / "statsmodels_logit_summary.txt")
     _save_coefficients_csv(
         res=res,
@@ -391,13 +464,14 @@ def main() -> None:
         out_path=out_dir / "coefficients.csv",
     )
 
+    # Save plots + metrics
     plot_and_save_confusion_matrix(
         y_true=y_test.values,
         y_pred=test_pred,
         out_path=out_dir / "confusion_matrix_test.png",
         threshold=thr_used,
-        accuracy=acc,
-        balanced_accuracy=bal,
+        accuracy=test_acc,
+        balanced_accuracy=test_bal,
         title_prefix="Logit Confusion Matrix (holdout test)",
     )
     plot_and_save_roc(
@@ -410,22 +484,127 @@ def main() -> None:
     (out_dir / "metrics_test.txt").write_text(
         "\n".join(
             [
-                "eval: holdout",
-                f"n_total: {len(y)}",
-                f"n_train: {len(y_train)}",
-                f"n_test: {len(y_test)}",
+                "eval: holdout_only",
+                f"mode: {args.mode}",
+                f"space_name: {args.space_name}",
+                "",
+                f"n_total_after_dropna: {n}",
+                f"n_train: {len(train_idx)}",
+                f"n_test: {len(test_idx)}",
+                "",
+                f"add_intercept: {add_intercept}",
                 "",
                 f"threshold_used: {thr_used}",
-                f"TEST_auc: {auc_val:.6f}",
-                f"TEST_accuracy: {acc:.6f}",
-                f"TEST_balanced_accuracy: {bal:.6f}",
+                "",
+                f"TEST_auc: {test_auc:.6f}",
+                f"TEST_accuracy: {test_acc:.6f}",
+                f"TEST_balanced_accuracy: {test_bal:.6f}",
             ]
         )
         + "\n"
     )
 
+    _write_json(
+        out_dir / "run_config.json",
+        {
+            "model": "logistic_regression_statsmodels",
+            "eval": "holdout_only",
+            "mode": args.mode,
+            "space_name": args.space_name,
+            "x_path": str(args.x) if args.mode == "space" else None,
+            "y_path": str(args.y) if args.mode == "space" else None,
+            "raw_csv": str(args.raw_csv) if args.mode == "raw" else None,
+            "target_col": args.target_col,
+            "test_size": float(args.test_size),
+            "random_state": int(args.random_state),
+            "add_intercept": bool(add_intercept),
+            "threshold_used": float(thr_used),
+            "optimize_threshold": bool(args.optimize_threshold),
+            "threshold_metric": args.threshold_metric,
+            "threshold_grid_size": int(args.threshold_grid_size),
+            "refit_full": bool(args.refit_full),
+            "notes": [
+                "Rows are NOT reordered. Train/test split is done by sampling indices.",
+                "predictions_all_in_original_order.csv is sorted by row_index and aligns to post-dropna aligned X/y.",
+                "orig_row_index maps back to the original file row number before dropna.",
+            ],
+        },
+    )
+
+    # ----------------------------
+    # Predictions for ALL datapoints (in original row order)
+    # ----------------------------
+    X_all_mat = coerce_X_to_numeric(X)
+    if add_intercept:
+        X_all_mat = sm.add_constant(X_all_mat, has_constant="add")
+
+    all_probs = np.asarray(res.predict(X_all_mat)).ravel()
+    all_pred = _probs_to_preds(all_probs, thr_used)
+
+    split = np.array(["train"] * n, dtype=object)
+    split[test_idx] = "test"
+
+    pred_all = pd.DataFrame(
+        {
+            "row_index": np.arange(n, dtype=int),
+            "orig_row_index": orig_row_index.astype(int),
+            "split": split,
+            "y_true": y.values.astype(int),
+            "prob": all_probs.astype(float),
+            "y_pred": all_pred.astype(int),
+        }
+    ).sort_values("row_index", kind="mergesort")
+
+    pred_all.to_csv(out_dir / "predictions_all_in_original_order.csv", index=False)
+
+    (out_dir / "note_predictions_all.txt").write_text(
+        "\n".join(
+            [
+                "predictions_all_in_original_order.csv notes:",
+                "- File is sorted by row_index ascending.",
+                "- row_index refers to the aligned (post-dropna) X/y row number used for modeling.",
+                "- orig_row_index refers to the original row number in the loaded input file(s) before dropna.",
+                "- 'prob' is the predicted probability for class 1 from the TRAIN-fit model.",
+                "- Model used here is fit on TRAIN ONLY.",
+                "- split='test' rows are out-of-sample; split='train' rows are in-sample.",
+            ]
+        )
+        + "\n"
+    )
+
+    # Optional: refit on full data and save full-data predictions (production-style)
+    if args.refit_full:
+        res_full, X_all_fit_mat = fit_logit_statsmodels(X, y, add_intercept=add_intercept)
+
+        full_probs = np.asarray(res_full.predict(X_all_fit_mat)).ravel()
+        full_pred = _probs_to_preds(full_probs, thr_used)
+
+        pred_full = pd.DataFrame(
+            {
+                "row_index": np.arange(n, dtype=int),
+                "orig_row_index": orig_row_index.astype(int),
+                "y_true": y.values.astype(int),
+                "prob": full_probs.astype(float),
+                "y_pred": full_pred.astype(int),
+            }
+        ).sort_values("row_index", kind="mergesort")
+
+        pred_full.to_csv(out_dir / "predictions_all_refit_full.csv", index=False)
+
+        (out_dir / "note_predictions_all_refit_full.txt").write_text(
+            "\n".join(
+                [
+                    "predictions_all_refit_full.csv notes:",
+                    "- Model was refit on ALL data after reporting holdout test metrics.",
+                    "- These are NOT out-of-sample predictions (fit-on-all).",
+                    "- File is sorted by row_index to match aligned X/y order.",
+                ]
+            )
+            + "\n"
+        )
+
     print(f"[OK] Wrote outputs to: {out_dir}")
-    print(f"[OK] TEST AUC={auc_val:.4f}  acc={acc:.4f}  bal_acc={bal:.4f}  thr={thr_used:.4g}")
+    print(f"[OK] TEST AUC={test_auc:.4f}  acc={test_acc:.4f}  bal_acc={test_bal:.4f}  thr={thr_used:.4g}")
 
 
 if __name__ == "__main__":

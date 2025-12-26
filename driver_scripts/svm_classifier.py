@@ -25,24 +25,26 @@ from sklearn.metrics import (
 )
 
 """
-CV-FREE SVM driver (holdout only).
+Holdout-only SVM driver (NO CV), with "predictions for ALL datapoints" that
+preserve the ORIGINAL row order from your input files.
 
-What it does:
-  - One stratified train/test split
-  - Fit SVM on train
-  - Evaluate once on test
-  - Save confusion matrix + ROC + metrics to:
-      analysis/<space-name>/svm/holdout/
+Key outputs (mirrors your logistic regression behavior):
+  analysis/<space-name>/svm/holdout/
+    - metrics_test.txt
+    - confusion_matrix_test.png
+    - roc_curve_test.png
+    - run_config.json
+    - predictions_all_in_original_order.csv
 
-Run like your logistic regression:
-python driver_scripts/svm.py \
-  --mode space \
-  --x data/features.csv \
-  --y data/qualification_target.csv \
-  --target-col "Qualified Municipality" \
-  --space-name raw_features \
-  --test-size 0.25 \
-  --random-state 0
+About row order / shuffling:
+- We NEVER shuffle the dataset itself.
+- We create train/test SPLITS by sampling indices, but we store predictions back into
+  an array aligned to the original row order (0..N-1 after optional NA dropping).
+- The output `predictions_all_in_original_order.csv` is sorted by row_index ascending,
+  so row_index i corresponds to row i of the *post-dropna aligned* X/y.
+
+If you want to keep a mapping to the *pre-dropna* original row indices, we also store
+`orig_row_index` (the row number in the original loaded file(s) before dropping NA).
 """
 
 # ----------------------------
@@ -95,30 +97,10 @@ def read_target(path: Path, target_col: str) -> pd.Series:
     path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(path)
-
     df = pd.read_csv(path)
     if target_col not in df.columns:
         raise KeyError(f"Target column {target_col!r} not found in {path}")
-
     return coerce_binary_target(df[target_col], name=target_col)
-
-
-def align_xy(X: pd.DataFrame, y: pd.Series, *, drop_na: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
-    if len(X) != len(y):
-        raise ValueError(
-            f"Row mismatch: X has {len(X)} rows, y has {len(y)} rows. "
-            "Make sure both were generated from the same filtered rows and saved in the same order."
-        )
-
-    X2 = X.copy()
-    y2 = y.copy()
-
-    if drop_na:
-        keep = ~(X2.isna().any(axis=1) | y2.isna())
-        X2 = X2.loc[keep].reset_index(drop=True)
-        y2 = y2.loc[keep].reset_index(drop=True)
-
-    return X2, y2
 
 
 def split_raw_csv(
@@ -162,6 +144,33 @@ def coerce_X_to_numeric(X: pd.DataFrame) -> pd.DataFrame:
             f"Problem columns (examples): {bad_cols[:20]}"
         )
     return Xn
+
+
+def align_xy_preserve_original_index(
+    X: pd.DataFrame, y: pd.Series, *, drop_na: bool = True
+) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
+    """
+    Align X and y by row order, optionally drop NA rows, and return:
+      - X_aligned
+      - y_aligned
+      - orig_row_index: mapping back to the original row indices BEFORE drop_na
+    """
+    if len(X) != len(y):
+        raise ValueError(
+            f"Row mismatch: X has {len(X)} rows, y has {len(y)} rows. "
+            "Make sure both were saved in the same order."
+        )
+
+    orig_idx = np.arange(len(y), dtype=int)
+
+    if drop_na:
+        keep = ~(X.isna().any(axis=1) | y.isna())
+        X2 = X.loc[keep].reset_index(drop=True)
+        y2 = y.loc[keep].reset_index(drop=True)
+        orig_idx2 = orig_idx[keep.values]  # keep.values is boolean array
+        return X2, y2, orig_idx2
+
+    return X.reset_index(drop=True), y.reset_index(drop=True), orig_idx
 
 
 # ----------------------------
@@ -304,51 +313,21 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.write_text(json.dumps(obj, indent=2) + "\n")
 
 
-def _write_run_config(args: argparse.Namespace, out_path: Path) -> None:
-    _write_json(
-        out_path,
-        {
-            "model": "svm",
-            "svm_type": args.svm_type,
-            "kernel": args.kernel,
-            "C": float(args.C),
-            "gamma": args.gamma if isinstance(args.gamma, str) else float(args.gamma),
-            "degree": int(args.degree),
-            "probability": bool(args.probability),
-            "max_iter": int(args.max_iter),
-            "class_weight": args.class_weight,
-            "threshold": float(args.threshold),
-            "optimize_threshold": bool(args.optimize_threshold),
-            "threshold_metric": args.threshold_metric,
-            "threshold_grid_size": int(args.threshold_grid_size),
-            "test_size": float(args.test_size),
-            "random_state": int(args.random_state),
-            "mode": args.mode,
-            "space_name": args.space_name,
-            "x": str(args.x) if args.x is not None else None,
-            "y": str(args.y) if args.y is not None else None,
-            "raw_csv": str(args.raw_csv) if args.raw_csv is not None else None,
-            "target_col": args.target_col,
-        },
-    )
-
-
 # ----------------------------
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Run an SVM classifier (with scaling) on either (a) X (.npy/.csv) + y (CSV), "
-            "or (b) a raw CSV containing both features and target.\n"
-            "CV-FREE: always does a single holdout train/test split."
+            "Holdout-only SVM (no CV). Fits on train split, evaluates on test split.\n"
+            "Also saves predictions for all datapoints in ORIGINAL row order."
         )
     )
 
     p.add_argument("--mode", choices=["space", "raw"], default="space")
 
-    # space-mode inputs
-    p.add_argument("--x", type=Path, default=Path("analysis/pca/pca_space.npy"))
+    # space-mode inputs (match your logistic_regression call style)
+    p.add_argument("--x", type=Path, default=Path("data/features.csv"))
     p.add_argument("--y", type=Path, default=Path("data/qualification_target.csv"))
 
     # raw-mode input
@@ -358,12 +337,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--target-col", type=str, default="Qualified Municipality")
 
-    # Holdout split
+    # Split params (match your logistic call)
     p.add_argument("--test-size", type=float, default=0.25)
     p.add_argument("--random-state", type=int, default=0)
 
-    # Output
-    p.add_argument("--space-name", type=str, default="pca")
+    # Output organization
+    p.add_argument("--space-name", type=str, default="raw_features")
     p.add_argument("--out-root", type=Path, default=Path("analysis"))
 
     # SVM config
@@ -372,19 +351,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--C", type=float, default=1.0)
     p.add_argument("--gamma", type=str, default="scale")
     p.add_argument("--degree", type=int, default=3)
-    p.add_argument("--probability", action="store_true", help="If set, SVC fits probability estimates (slower).")
+    p.add_argument("--probability", action="store_true", help="For SVC only; slower but enables predict_proba.")
     p.add_argument("--max-iter", type=int, default=10000, help="For LinearSVC max_iter.")
     p.add_argument("--class-weight", choices=["balanced", "none"], default="balanced")
 
-    # Thresholding
+    # Thresholding + optional optimization (train-only, no CV)
     p.add_argument("--threshold", type=float, default=0.0, help="Threshold on SVM score (default: 0.0).")
-    p.add_argument("--optimize-threshold", action="store_true")
+    p.add_argument(
+        "--optimize-threshold",
+        action="store_true",
+        help="If set, choose threshold to maximize a metric using TRAIN in-sample scores (no CV).",
+    )
     p.add_argument("--threshold-metric", choices=["balanced_accuracy", "accuracy"], default="balanced_accuracy")
     p.add_argument("--threshold-grid-size", type=int, default=200)
+
+    # Optional refit on full dataset after evaluation (for a production model)
+    p.add_argument(
+        "--refit-full",
+        action="store_true",
+        help="After evaluating on test, refit the same model on ALL data and save predictions_all_refit_full.csv",
+    )
 
     return p.parse_args()
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> None:
     args = parse_args()
     args.gamma = _parse_gamma(args.gamma)
@@ -394,19 +387,19 @@ def main() -> None:
 
     # Load X,y
     if args.mode == "space":
-        X = read_design_matrix(args.x)
-        y = read_target(args.y, args.target_col)
-        X, y = align_xy(X, y, drop_na=True)
+        X_raw = read_design_matrix(args.x)
+        y_raw = read_target(args.y, args.target_col)
+        X, y, orig_row_index = align_xy_preserve_original_index(X_raw, y_raw, drop_na=True)
     else:
         if args.raw_csv is None:
             raise ValueError("--raw-csv is required when --mode raw")
-        X, y = split_raw_csv(
+        X_raw, y_raw = split_raw_csv(
             args.raw_csv,
             target_col=args.target_col,
             drop_cols=args.drop_cols,
             feature_cols=args.feature_cols,
         )
-        X, y = align_xy(X, y, drop_na=True)
+        X, y, orig_row_index = align_xy_preserve_original_index(X_raw, y_raw, drop_na=True)
 
     X = coerce_X_to_numeric(X)
 
@@ -414,30 +407,31 @@ def main() -> None:
     if len(uniq) != 2:
         raise ValueError(f"Target must have two classes; got {uniq.tolist()}.")
 
-    # Save config snapshot
-    _write_run_config(args, out_dir / "run_config.json")
-
-    # Holdout split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+    n = len(y)
+    # IMPORTANT: we split on INDICES, not by shuffling rows
+    idx = np.arange(n, dtype=int)
+    train_idx, test_idx = train_test_split(
+        idx,
         test_size=float(args.test_size),
         random_state=int(args.random_state),
-        stratify=y,
+        shuffle=True,
+        stratify=y.values,
     )
 
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+    # Fit on train
     model = _build_model(args)
     model.fit(X_train, y_train)
 
-    test_scores = _get_scores(model, X_test)
-
+    # Threshold (either fixed or optimized on TRAIN in-sample)
     thr_used = float(args.threshold)
     if args.optimize_threshold:
-        # Note: without CV, "cleanest" is to optimize on TRAIN in-sample scores only.
         train_scores = _get_scores(model, X_train)
         thr_used, thr_val = find_best_threshold(
-            y_train.values,
-            train_scores,
+            y_true=y_train.values,
+            scores=train_scores,
             metric=args.threshold_metric,
             grid_size=int(args.threshold_grid_size),
         )
@@ -447,25 +441,28 @@ def main() -> None:
                     f"optimized_threshold: {thr_used}",
                     f"optimized_metric: {args.threshold_metric}",
                     f"optimized_metric_value_train_in_sample: {thr_val}",
-                    "note: optimized on training in-sample scores (no CV).",
+                    "note: optimized on TRAIN in-sample scores (no CV).",
                 ]
             )
             + "\n"
         )
 
+    # Evaluate on test
+    test_scores = _get_scores(model, X_test)
     test_pred = _scores_to_preds(test_scores, thr_used)
 
-    acc = float(accuracy_score(y_test.values, test_pred))
-    bal = float(balanced_accuracy_score(y_test.values, test_pred))
-    auc_val = float(roc_auc_score(y_test.values, test_scores))
+    test_acc = float(accuracy_score(y_test.values, test_pred))
+    test_bal = float(balanced_accuracy_score(y_test.values, test_pred))
+    test_auc = float(roc_auc_score(y_test.values, test_scores))
 
+    # Save plots + metrics
     plot_and_save_confusion_matrix(
         y_true=y_test.values,
         y_pred=test_pred,
         out_path=out_dir / "confusion_matrix_test.png",
         threshold=thr_used,
-        accuracy=acc,
-        balanced_accuracy=bal,
+        accuracy=test_acc,
+        balanced_accuracy=test_bal,
         title_prefix="SVM Confusion Matrix (holdout test)",
     )
     plot_and_save_roc(
@@ -478,22 +475,140 @@ def main() -> None:
     (out_dir / "metrics_test.txt").write_text(
         "\n".join(
             [
-                "eval: holdout",
-                f"n_total: {len(y)}",
-                f"n_train: {len(y_train)}",
-                f"n_test: {len(y_test)}",
+                "eval: holdout_only",
+                f"mode: {args.mode}",
+                f"space_name: {args.space_name}",
+                "",
+                f"n_total_after_dropna: {n}",
+                f"n_train: {len(train_idx)}",
+                f"n_test: {len(test_idx)}",
+                "",
+                f"svm_type: {args.svm_type}",
+                f"kernel: {args.kernel}",
+                f"C: {float(args.C)}",
+                f"gamma: {args.gamma}",
+                f"degree: {int(args.degree)}",
+                f"class_weight: {args.class_weight}",
+                f"probability: {bool(args.probability)}",
                 "",
                 f"threshold_used: {thr_used}",
-                f"TEST_auc: {auc_val:.6f}",
-                f"TEST_accuracy: {acc:.6f}",
-                f"TEST_balanced_accuracy: {bal:.6f}",
+                "",
+                f"TEST_auc: {test_auc:.6f}",
+                f"TEST_accuracy: {test_acc:.6f}",
+                f"TEST_balanced_accuracy: {test_bal:.6f}",
             ]
         )
         + "\n"
     )
 
+    _write_json(
+        out_dir / "run_config.json",
+        {
+            "model": "svm",
+            "eval": "holdout_only",
+            "mode": args.mode,
+            "space_name": args.space_name,
+            "x_path": str(args.x) if args.mode == "space" else None,
+            "y_path": str(args.y) if args.mode == "space" else None,
+            "raw_csv": str(args.raw_csv) if args.mode == "raw" else None,
+            "target_col": args.target_col,
+            "test_size": float(args.test_size),
+            "random_state": int(args.random_state),
+            "svm_type": args.svm_type,
+            "kernel": args.kernel,
+            "C": float(args.C),
+            "gamma": args.gamma if isinstance(args.gamma, str) else float(args.gamma),
+            "degree": int(args.degree),
+            "probability": bool(args.probability),
+            "max_iter": int(args.max_iter),
+            "class_weight": args.class_weight,
+            "threshold_used": float(thr_used),
+            "optimize_threshold": bool(args.optimize_threshold),
+            "threshold_metric": args.threshold_metric,
+            "threshold_grid_size": int(args.threshold_grid_size),
+            "refit_full": bool(args.refit_full),
+            "notes": [
+                "Rows are NOT reordered. Train/test split is done by sampling indices.",
+                "predictions_all_in_original_order.csv is sorted by row_index and aligns to post-dropna aligned X/y.",
+                "orig_row_index maps back to the original file row number before dropna.",
+            ],
+        },
+    )
+
+    # ----------------------------
+    # Predictions for ALL datapoints (in original row order)
+    # ----------------------------
+    # Compute scores for all rows using the TRAIN-fit model
+    all_scores = _get_scores(model, X)
+    all_pred = _scores_to_preds(all_scores, thr_used)
+
+    split = np.array(["train"] * n, dtype=object)
+    split[test_idx] = "test"
+
+    # Assemble and SORT by row_index so it matches original row order
+    pred_all = pd.DataFrame(
+        {
+            # row index in the post-dropna aligned dataset
+            "row_index": np.arange(n, dtype=int),
+            # row index in the original input files before dropping NA
+            "orig_row_index": orig_row_index.astype(int),
+            "split": split,
+            "y_true": y.values.astype(int),
+            "score": all_scores.astype(float),
+            "y_pred": all_pred.astype(int),
+        }
+    ).sort_values("row_index", kind="mergesort")  # stable sort
+
+    pred_all.to_csv(out_dir / "predictions_all_in_original_order.csv", index=False)
+
+    (out_dir / "note_predictions_all.txt").write_text(
+        "\n".join(
+            [
+                "predictions_all_in_original_order.csv notes:",
+                "- File is sorted by row_index ascending.",
+                "- row_index refers to the aligned (post-dropna) X/y row number used for modeling.",
+                "- orig_row_index refers to the original row number in the loaded input file(s) before dropna.",
+                "- 'score' is decision_function (preferred) or predict_proba[:,1] if decision_function unavailable.",
+                "- Model used here is fit on TRAIN ONLY.",
+                "- split='test' rows are out-of-sample; split='train' rows are in-sample.",
+            ]
+        )
+        + "\n"
+    )
+
+    # Optional: refit on full data and save full-data predictions (production-style)
+    if args.refit_full:
+        model_full = _build_model(args)
+        model_full.fit(X, y)
+        full_scores = _get_scores(model_full, X)
+        full_pred = _scores_to_preds(full_scores, thr_used)
+
+        pred_full = pd.DataFrame(
+            {
+                "row_index": np.arange(n, dtype=int),
+                "orig_row_index": orig_row_index.astype(int),
+                "y_true": y.values.astype(int),
+                "score": full_scores.astype(float),
+                "y_pred": full_pred.astype(int),
+            }
+        ).sort_values("row_index", kind="mergesort")
+
+        pred_full.to_csv(out_dir / "predictions_all_refit_full.csv", index=False)
+
+        (out_dir / "note_predictions_all_refit_full.txt").write_text(
+            "\n".join(
+                [
+                    "predictions_all_refit_full.csv notes:",
+                    "- Model was refit on ALL data after reporting holdout test metrics.",
+                    "- These are NOT out-of-sample predictions (fit-on-all).",
+                    "- File is sorted by row_index to match aligned X/y order.",
+                ]
+            )
+            + "\n"
+        )
+
     print(f"[OK] Wrote outputs to: {out_dir}")
-    print(f"[OK] TEST AUC={auc_val:.4f}  acc={acc:.4f}  bal_acc={bal:.4f}  thr={thr_used:.4g}")
+    print(f"[OK] TEST AUC={test_auc:.4f}  acc={test_acc:.4f}  bal_acc={test_bal:.4f}  thr={thr_used:.4g}")
 
 
 if __name__ == "__main__":
