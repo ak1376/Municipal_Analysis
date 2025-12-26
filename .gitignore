@@ -1,0 +1,6 @@
+analysis/
+src/__pycache__/
+
+data/
+plots/
+notebooks/
