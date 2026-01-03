@@ -1,0 +1,15 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+joblib
+yaml
+argparse
+geopandas
+dataclasses
+pathlib
+typing
+json
+sys
+hashlib
+re
