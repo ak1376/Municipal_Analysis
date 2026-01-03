@@ -1,4 +1,4 @@
-# Modeling: Raw vs PCA vs PLS with Logistic Regression, Decision Tree, and SVM
+# Modeling NJ Municipal Data: Raw Features vs PCA Decomposition vs PLS Decomposition with Logistic Regression, Decision Tree, and Support Vector Machines (SVMs)
 
 ## Overview
 
