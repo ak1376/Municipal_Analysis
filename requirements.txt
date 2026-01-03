@@ -1,15 +1,17 @@
 numpy
 pandas
+scipy
 matplotlib
+seaborn
 scikit-learn
 joblib
-yaml
-argparse
+
+# geospatial stack
 geopandas
-dataclasses
-pathlib
-typing
-json
-sys
-hashlib
-re
+shapely
+pyproj
+fiona
+
+# file formats
+openpyxl
+pyyaml
