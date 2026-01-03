@@ -14,6 +14,8 @@ _SUFFIXES = [
 
 plot_dir = Path(__file__).parent.parent / "plots"
 
+os.makedirs(plot_dir, exist_ok=True)
+
 def canonical_muni_name(s: str) -> str:
     """
     Make municipality names comparable across your table and Census shapefiles.

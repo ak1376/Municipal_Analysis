@@ -20,8 +20,8 @@ def _add_repo_root_to_syspath() -> Path:
 REPO_ROOT = _add_repo_root_to_syspath()
 
 # Now these imports work when run as: python driver_scripts/process.py
-from scripts.create_map import plot_nj_qualification_map
-from scripts.data_processing import read_tsm_excel, build_xy
+from src.create_map import plot_nj_qualification_map
+from src.data_processing import read_tsm_excel, build_xy
 
 
 TARGET_COL_DEFAULT = "Qualified Municipality"
