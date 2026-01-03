@@ -108,11 +108,12 @@ Outputs:
 #### PLS
 ```
 python driver_scripts/pls_decomp.py \
-  --features-csv data/features.csv \
-  --target-csv data/qualification_target.csv \
+  --x data/features.csv \
+  --y data/qualification_target.csv \
   --target-col "Qualified Municipality" \
   --variance-threshold 0.90 \
-  --out-dir analysis/pls
+  --out-root analysis \
+  --space-name pls
 ```
 
 Outputs:
@@ -259,47 +260,19 @@ python driver_scripts/svm_classifier.py \
 
 ### Step 6: Train the Final Model (fit on ALL rows)
 
-Once you pick the best model/space from LOOCV, run the final fit so you have a production model trained on all data.
-
-Example: SVM + PLS
-
-```
-python driver_scripts/svm_classifier.py \
-  --mode space \
-  --eval final \
-  --x analysis/pls/pls_space.csv \
-  --y data/qualification_target.csv \
-  --target-col "Qualified Municipality" \
-  --space-name pls \
-  --out-root analysis \
-  --svm-type svc \
-  --kernel linear \
-  --C 1.0 \
-  --threshold 0.0 \
-  --class-weight balanced
-```
-
-This should create:
-
-`analysis/pls/svm/loocv/final_model.joblib`
-
-`analysis/pls/svm/final_predictions.csv` (or similarly named output)
+Once you pick the best model/space from LOOCV, run the final fit so you have a production model trained on all data. The previous python functions already build the final model by default
 
 ### Step 7: Generate a Prediction CSV for Mapping
 
-Your map script expects a CSV that contains at least:
-
-y_true
-
-y_pred
-
-plus either prob or score
+Now that we have a final model, we need to pass our entire dataset through the model to get predictions for each observation. 
 
 Example: produce predictions from a fitted SVM model:
 
 `python best_performing_model.py`
 
 ### Step 8: Plot the Prediction Map
+
+Now we can plot visually how well the model does on different municipalities. 
 
 Example:
 ```
@@ -310,6 +283,19 @@ python driver_scripts/plot_prediction_map.py \
   --muni-col "Municipality" \
   --target-col "Qualified Municipality" \
   --mode correctness \
+  --polygon \
+  --model-label "SVM + PLS (final)" \
+  --out analysis/pls/svm/prediction_map.png
+```
+  This plot colors each county by how well the model predicted the municipalities. If we want a more granular plot we can do the following: 
+```
+python driver_scripts/plot_prediction_map.py \
+  --raw data/TSM.xlsx \
+  --excel-header 2 \
+  --pred-csv analysis/pls/svm/final_predictions.csv \
+  --muni-col "Municipality" \
+  --target-col "Qualified Municipality" \
+  --mode percent_correct \
   --polygon \
   --model-label "SVM + PLS (final)" \
   --out analysis/pls/svm/prediction_map.png
